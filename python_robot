@@ -1,0 +1,203 @@
+import requests
+from lxml import html
+from bs4 import BeautifulSoup as bs
+import pandas as pd
+import base64
+import re
+from tqdm import tqdm
+import datetime
+import glob
+import os
+
+## Use this only for Azure AD service-to-service authentication
+from azure.common.credentials import ServicePrincipalCredentials
+## Use this only for Azure AD end-user authentication
+from azure.common.credentials import UserPassCredentials
+## Use this only for Azure AD multi-factor authentication
+from msrestazure.azure_active_directory import AADTokenCredentials
+## Required for Azure Data Lake Storage Gen1 account management
+from azure.mgmt.datalake.store import DataLakeStoreAccountManagementClient
+from azure.mgmt.datalake.store.models import DataLakeStoreAccount
+## Required for Azure Data Lake Storage Gen1 filesystem management
+from azure.datalake.store import core, lib, multithread
+## Common Azure imports
+from azure.mgmt.resource.resources import ResourceManagementClient
+from azure.mgmt.resource.resources.models import ResourceGroup
+## Use these as needed for your application
+import logging, getpass, pprint, uuid, time
+
+print('1. All Imports Done', flush=True)
+print('------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------')
+
+tenant = ''
+RESOURCE = ''
+client_id = ''
+client_secret = ''
+
+adlsAccountName = 'x'
+
+adlCreds = lib.auth(tenant_id = tenant,
+                client_secret = client_secret,
+                client_id = client_id,
+                resource = RESOURCE)
+## Create a filesystem client object
+adlsFileSystemClient = core.AzureDLFileSystem(adlCreds, store_name=adlsAccountName)
+
+print('2. Azure configs Done', flush=True)
+print('------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------')
+
+# Entering on initial URL to get all list stations
+localPath = os.getcwd() + '\\'
+stationsUrl = 'http://www.inmet.gov.br/sim/sonabra/index.php'
+initialRequest = requests.get(stationsUrl)
+initialHtml = bs(initialRequest.text, 'html.parser')
+
+stringHtml = str(initialHtml)
+lenURL = len('http://www.inmet.gov.br/sim/sonabra/dspDadosCodigo.php?')
+
+print('3. URL Stations Retrieved', flush=True)
+print('------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------')
+
+# Defining date params to search 30 days before of actual date
+today = datetime.datetime.now()
+delta = datetime.timedelta(days=30)
+initialDate = today - delta
+
+initialSearchDay = str(initialDate.day) + '%2F'
+initialSearchMonth = str(initialDate.month) + '%2F'
+initialSearchYear = str(initialDate.year)
+
+endSearchDay = str(today.day) + '%2F'
+endSearchMonth = str(today.month) + '%2F'
+endSearchYear = str(today.year)
+
+initialSearchDateParam = initialSearchDay + initialSearchMonth + initialSearchYear
+endSearchDateParam = endSearchDay + endSearchMonth + endSearchYear
+
+print('4. Date Params Done', flush=True)
+print('------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------')
+
+##Get the latitude List for all the stations
+longitudeList = []
+
+for x in [m.start() for m in re.finditer('Latitude: ', stringHtml)]:
+    lat = stringHtml[x+10:x+16]
+    longitudeList.append(lat)
+
+##Get the longitude List for all the stations
+latitudeList = []
+
+for x in [m.start() for m in re.finditer('Longitude: ', stringHtml)]:
+    lng = stringHtml[x+11:x+17]
+    latitudeList.append(lng)
+
+##Get the longitude List for all the stations
+altitudeList = []
+
+for x in [m.start() for m in re.finditer('Altitude: ', stringHtml)]:
+    alt = stringHtml[x+10:x+16].replace('m','').replace('me','').replace('et','').replace('e','')
+    altitudeList.append(alt)
+    
+idx = 0
+
+print('5. Long, Lat and Long treatment done.', flush=True)
+print('------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------')
+
+    
+for x in [m.start() for m in re.finditer('http://www.inmet.gov.br/sim/sonabra/dspDadosCodigo.php?', stringHtml)]:
+    urlEstacao = stringHtml[x:x+lenURL+8]
+    codEstacao = stringHtml[x+lenURL:x+lenURL+8]
+    codEstacaoEncoded = base64.b64decode((stringHtml[x+lenURL:x+lenURL+8])).decode('utf-8')
+    
+    idx+=1
+   
+    # Connect to the website
+    targetURL = urlEstacao
+    body_data = 'aleaValue=MTYyNw%3D%3D&dtaini=' + initialSearchDateParam + '&dtafim=' + endSearchDateParam + '&aleaNum=1627'
+    session = requests.Session()
+    session.headers.update({'Content-Type':'application/x-www-form-urlencoded'})
+    dataPage = session.post(targetURL, data=body_data)
+    htmlPage = bs(dataPage.text, 'html.parser')
+
+    try:
+        # Find all tables
+        tables = htmlPage.select('tr:nth-child(2) > td > table:nth-child(2)')
+
+        x = str(tables[0])
+        firstIndex = x.index('<tr>')
+        lastIndex = x.index('</tr>')
+
+        removeTrs = x.replace(x[firstIndex:lastIndex], '').replace(u'\xa0','').replace('\n','')
+
+        htmlTable = pd.read_html(str(removeTrs))[0]
+        
+        htmlTable['Estacao'] = codEstacaoEncoded   
+        htmlTable['Lat'] = longitudeList[idx]
+        htmlTable['Long'] = longitudeList[idx]
+        htmlTable['Alt'] = altitudeList[idx]
+        htmlTable['Tipo Estacao'] = 'Convencional'
+        
+
+        htmlTable.columns = ['Data', 'UTC', '(°C)', '(%)', '(hPa)', 'Vel.(m/s)', 'Dir.(º)',\
+           '(Décimos)', '(h)', 'TemperaturaMáx. (°C)', 'TemperaturaMín. (°C)',\
+           'Chuva(mm)', 'Estacao', 'Lat','Long', 'Alt','Tipo Estacao']
+
+        htmlTable.to_csv(localPath + codEstacaoEncoded + 'est.csv', index=False, sep=';',encoding='utf-8')
+
+    except:
+        print('No Data found for: ' + codEstacaoEncoded)
+        
+print('6. Tables Found and exported to CSV to: ' + localPath + codEstacaoEncoded, flush=True)
+print('------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------')
+
+#List all directory files
+path = localPath
+all_files = glob.glob(path + "/*.csv")
+li = []
+
+#For all the files append (union everything) to create a single dataframe
+for fileName in all_files:
+    df = pd.read_csv(fileName, index_col=None, header=0, sep=";")
+    li.append(df)
+    
+print('7. Appended all the files', flush=True)
+print('------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------')
+
+
+frame = pd.concat(li, axis=0, ignore_index=True)
+
+#Add 2 columns based on the column Date, with only Month and Year to split after by them
+frame['Mes'] = frame.apply(lambda x:x['Data'][3:5], axis=1)
+frame['Ano'] = frame.apply(lambda x:x['Data'][6:10], axis=1)
+
+print('8. Create Month and Year columns', flush=True)
+print('------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------')
+
+#Get the unique values for the Date column
+datesList = frame['Data'].unique()
+
+#Split files into MONTH + YEAR and then generate the CSV
+for val in datesList:
+    fileName = val[3:5] + val[6:10] + '.csv'
+    filePathName = localPath + val[3:5] + val[6:10] + '.csv'
+    
+    tempDf = frame.loc[(frame['Mes'] == val[3:5]) & (frame['Ano'] == val[6:10])]
+    tempDf.to_csv(filePathName, index=False, sep=';',encoding='utf-8')
+    
+#Get all the files with 'est' in the name and erase to keep all the things clean.
+estFileList = glob.glob(os.path.join(localPath, '*est.csv'))
+for f in estFileList:
+    os.remove(f)
+
+#Get all the remaining files on the directory and upload it to DW.
+filesList = os.listdir(localPath)
+for fileName in glob.glob('*.csv'): 
+    multithread.ADLUploader(adlsFileSystemClient, lpath=localPath + fileName,\
+    rpath='x' + fileName,\
+    nthreads=64, overwrite=True, buffersize=4194304, blocksize=4194304) 
+    os.remove(fileName)
+    
+    print('Uploaded File:' + 'x' + fileName)
+    
+print('9. Job Done', flush=True)
+print('------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------')
